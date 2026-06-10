@@ -4,8 +4,8 @@ Synthetic Player dimension data for a live-service collectible card game CLTV pr
 v1 schema
 ---------
 player_id, home_timezone, registration_timestamp_utc, registration_timestamp_local,
-country, guild_id, acquisition_channel, referrer_player_id,
-install_platform, account_status, data_region
+country, guild_id, friends_count, acquisition_channel, referrer_player_id,
+install_platform, account_status, banned_datetime_utc, data_region
 
 """
 
@@ -59,6 +59,8 @@ INSTALL_PLATFORM_WEIGHTS = [0.45, 0.30, 0.25]
 ACCOUNT_STATUSES = ["active", "banned", "inactive"]
 ACCOUNT_STATUS_WEIGHTS = [0.92, 0.03, 0.05]
 
+FRIENDS_COUNT_CAP = 500
+
 COLUMN_ORDER = [
     "player_id",
     "home_timezone",
@@ -66,10 +68,12 @@ COLUMN_ORDER = [
     "registration_timestamp_local",
     "country",
     "guild_id",
+    "friends_count",
     "acquisition_channel",
     "referrer_player_id",
     "install_platform",
     "account_status",
+    "banned_datetime_utc",
     "data_region",
 ]
 
@@ -160,11 +164,66 @@ def _assign_referrer_player_ids(df: pd.DataFrame, rng: np.random.Generator) -> p
     return df
 
 
+def _draw_banned_datetimes(
+    registration_utc: list[datetime.datetime],
+    account_statuses: np.ndarray,
+    today: datetime.date,
+    rng: np.random.Generator,
+) -> list[datetime.datetime | None]:
+    banned: list[datetime.datetime | None] = []
+    for reg_ts, status in zip(registration_utc, account_statuses):
+        if status != "banned":
+            banned.append(None)
+            continue
+        registration_date = reg_ts.date()
+        tenure_days = max(1, (today - registration_date).days)
+        ban_days = int(rng.integers(1, min(30, tenure_days) + 1))
+        ban_date = registration_date + datetime.timedelta(days=ban_days)
+        banned.append(
+            datetime.datetime.combine(
+                ban_date, datetime.time(23, 59, 59), tzinfo=datetime.timezone.utc
+            )
+        )
+    return banned
+
+
+def _draw_friends_counts(has_guild: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    n = len(has_guild)
+    counts = np.empty(n, dtype=np.int64)
+    non_guild_idx = np.flatnonzero(~has_guild)
+    guild_idx = np.flatnonzero(has_guild)
+    if non_guild_idx.size:
+        counts[non_guild_idx] = rng.negative_binomial(2, 0.40, size=non_guild_idx.size)
+    if guild_idx.size:
+        counts[guild_idx] = rng.negative_binomial(4, 0.22, size=guild_idx.size)
+    return np.minimum(counts, FRIENDS_COUNT_CAP)
+
+
+def _validate_banned_invariants(df: pd.DataFrame) -> None:
+    is_banned = df["account_status"] == "banned"
+    if df.loc[is_banned, "banned_datetime_utc"].isna().any():
+        raise ValueError("banned players must have non-null banned_datetime_utc")
+    if df.loc[~is_banned, "banned_datetime_utc"].notna().any():
+        raise ValueError("non-banned players must have null banned_datetime_utc")
+    for _, row in df.loc[is_banned].iterrows():
+        reg_ts = row["registration_timestamp_utc"].to_pydatetime()
+        ban_ts = row["banned_datetime_utc"].to_pydatetime()
+        if ban_ts <= reg_ts:
+            raise ValueError(f"{row['player_id']}: banned_datetime_utc must be after registration")
+
+
 def _validate_registration_invariants(df: pd.DataFrame) -> None:
     for _, row in df.iterrows():
         utc_ts = row["registration_timestamp_utc"].to_pydatetime()
         local_ts = row["registration_timestamp_local"].to_pydatetime()
         assert_utc_local_invariant(utc_ts, local_ts, row["home_timezone"])
+
+
+def _validate_friends_count_invariants(df: pd.DataFrame) -> None:
+    if (df["friends_count"] < 0).any():
+        raise ValueError("friends_count must be >= 0")
+    if (df["friends_count"] > FRIENDS_COUNT_CAP).any():
+        raise ValueError(f"friends_count must be <= {FRIENDS_COUNT_CAP}")
 
 
 def generate_players(n: int, random_seed: int, game_age: int = 180) -> pd.DataFrame:
@@ -223,6 +282,10 @@ def generate_players(n: int, random_seed: int, game_age: int = 180) -> pd.DataFr
     guild_ids = [
         guild if in_guild else None for guild, in_guild in zip(assigned_guilds, has_guild)
     ]
+    friends_counts = _draw_friends_counts(has_guild, rng)
+    banned_datetimes = _draw_banned_datetimes(
+        registration_utc, account_statuses, today, rng
+    )
 
     df = pd.DataFrame(
         {
@@ -232,9 +295,11 @@ def generate_players(n: int, random_seed: int, game_age: int = 180) -> pd.DataFr
             "registration_timestamp_local": registration_local,
             "country": countries,
             "guild_id": guild_ids,
+            "friends_count": friends_counts,
             "acquisition_channel": acquisition_channels,
             "install_platform": install_platforms,
             "account_status": account_statuses,
+            "banned_datetime_utc": banned_datetimes,
             "data_region": data_regions,
         }
     )
@@ -250,7 +315,10 @@ def generate_players(n: int, random_seed: int, game_age: int = 180) -> pd.DataFr
     df["registration_timestamp_local"] = pd.to_datetime(
         df["registration_timestamp_local"]
     )
+    df["banned_datetime_utc"] = pd.to_datetime(df["banned_datetime_utc"], utc=True)
 
     _validate_registration_invariants(df)
+    _validate_banned_invariants(df)
+    _validate_friends_count_invariants(df)
 
     return df[COLUMN_ORDER]

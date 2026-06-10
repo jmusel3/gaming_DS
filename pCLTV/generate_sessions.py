@@ -17,6 +17,7 @@ import math
 import numpy as np
 import pandas as pd
 
+from pCLTV.player_latents import draw_player_latents
 from pCLTV.timezones import (
     assert_utc_local_invariant,
     draw_evening_local_time,
@@ -30,23 +31,18 @@ REQUIRED_PLAYER_COLUMNS = [
     "home_timezone",
     "install_platform",
     "account_status",
+    "banned_datetime_utc",
     "data_region",
     "country",
 ]
 
 DATA_REGIONS = ["NA", "EU", "APAC", "LATAM"]
 
-CHURN_TYPES = ["loyal", "fade", "early"]
-CHURN_TYPE_WEIGHTS = [0.55, 0.35, 0.10]
-
 BASE_REACTIVATION_PROB = {"loyal": 0.50, "fade": 0.20, "early": 0.08}
 REACTIVATION_DECAY = 0.85
-BASE_SESSION_RATE = 4.0
 
 SESSION_END_REASONS = ["normal", "app_crash", "disconnected"]
 SESSION_END_REASON_WEIGHTS = [0.88, 0.08, 0.04]
-
-PLATFORM_DURATION_FACTOR = {"ios": 1.0, "android": 1.0, "pc": 1.1}
 
 MAX_DURATION_MINUTES = 300.0
 
@@ -86,6 +82,13 @@ def _validate_players(players: pd.DataFrame) -> None:
     )
     if registration_ts.isna().any():
         raise ValueError("registration_timestamp_utc must be parseable as UTC datetimes")
+
+    is_banned = players["account_status"] == "banned"
+    banned_ts = pd.to_datetime(players["banned_datetime_utc"], utc=True, errors="coerce")
+    if is_banned.any() and banned_ts.loc[is_banned].isna().any():
+        raise ValueError("banned players must have non-null banned_datetime_utc")
+    if (~is_banned).any() and banned_ts.loc[~is_banned].notna().any():
+        raise ValueError("non-banned players must have null banned_datetime_utc")
 
 
 def _ensure_utc(dt: datetime.datetime) -> datetime.datetime:
@@ -150,40 +153,6 @@ def _draw_dormant_period(churn_type: str, rng: np.random.Generator) -> int:
     return int(rng.integers(low, high + 1))
 
 
-def _draw_player_latents(
-    row: pd.Series, rng: np.random.Generator, observation_end: datetime.date
-) -> dict:
-    registration_ts_utc = _to_utc_timestamp(row["registration_timestamp_utc"])
-    registration_date = registration_ts_utc.date()
-    tenure = max(1, (observation_end - registration_date).days)
-    account_status = row["account_status"]
-    install_platform = row["install_platform"]
-
-    engagement_score = float(rng.lognormal(0.0, 0.6))
-    weekly_session_rate = float(rng.gamma(2.0, engagement_score * BASE_SESSION_RATE))
-    platform_factor = PLATFORM_DURATION_FACTOR.get(install_platform, 1.0)
-    duration_scale = (engagement_score**0.7) * platform_factor
-
-    churn_type = str(rng.choice(CHURN_TYPES, p=CHURN_TYPE_WEIGHTS))
-    base_reactivation_prob = BASE_REACTIVATION_PROB[churn_type]
-    banned = account_status == "banned"
-
-    if account_status == "inactive":
-        churn_type = "early"
-        base_reactivation_prob *= 0.5
-
-    return {
-        "engagement_score": engagement_score,
-        "weekly_session_rate": max(weekly_session_rate, 0.5),
-        "duration_scale": duration_scale,
-        "churn_type": churn_type,
-        "base_reactivation_prob": base_reactivation_prob,
-        "banned": banned,
-        "tenure": tenure,
-        "registration_ts_utc": registration_ts_utc,
-    }
-
-
 def _draw_activity_cycles(
     latents: dict,
     row: pd.Series,
@@ -194,19 +163,11 @@ def _draw_activity_cycles(
     registration_ts_utc = latents["registration_ts_utc"]
 
     if latents["banned"]:
-        ban_days = int(
-            rng.integers(1, min(30, latents["tenure"]) + 1)
-        )
+        banned_ts = _to_utc_timestamp(row["banned_datetime_utc"])
         active_start = registration_ts_utc + datetime.timedelta(
             hours=float(rng.uniform(0, 48))
         )
-        active_end_date = registration_ts_utc.date() + datetime.timedelta(days=ban_days)
-        active_end = min(
-            datetime.datetime.combine(
-                active_end_date, datetime.time(23, 59, 59), tzinfo=datetime.timezone.utc
-            ),
-            obs_end_dt,
-        )
+        active_end = min(banned_ts, obs_end_dt)
         if active_start < active_end:
             return [(active_start, active_end)]
         return []
@@ -397,7 +358,7 @@ def _generate_player_sessions(
     rng: np.random.Generator,
     observation_end: datetime.date,
 ) -> list[dict]:
-    latents = _draw_player_latents(player_row, rng, observation_end)
+    latents = draw_player_latents(player_row, rng, observation_end)
     activity_cycles = _draw_activity_cycles(latents, player_row, rng, observation_end)
     session_timezone = player_row["home_timezone"]
 
